@@ -1,0 +1,110 @@
+pipeline {
+    agent any
+    tools {
+        maven 'maven3' 
+    }
+    environment {
+            SCANNER_HOME= tool 'sonar-scanner'
+            ECR_REPO_URL = '471112536763.dkr.ecr.us-east-1.amazonaws.com/mission'
+            dockerImage = "mission"
+            ECR_REPO = '471112536763.dkr.ecr.us-east-1.amazonaws.com'
+            AWS_REGION = 'us-east-1'
+    }
+
+    stages {
+        stage('git-checkout') {
+            steps {
+                git branch: 'main', url: 'https://github.com/Mohamedrazzak1/Mission.git'
+            }
+        }
+        stage('maven') {
+            steps {
+                sh 'mvn compile -DskipTests=true'
+                sh 'mvn test -DskipTests=true'
+            }
+        }
+        stage('trivy-scan') {
+            steps {
+                sh 'trivy fs --format table -o trivy-fs-report.html .'
+            }
+        }
+        stage('sonar-qube') {
+            steps {
+                withSonarQubeEnv('sonar') {
+                    sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=mission -Dsonar.projectKey=mission \
+                    -Dsonar.java.binaries=.'''
+                }
+            }
+        }
+        stage('quality-gate') {
+            steps {
+                waitForQualityGate abortPipeline: false, credentialsId: 'token-sonar'
+            }
+        }
+        stage('maven-package') {
+            steps {
+                sh 'mvn package -DskipTests=true'
+            }
+        }
+        stage('deployto artifact') {
+            steps {
+                withMaven(globalMavenSettingsConfig: 'globalm', jdk: '', maven: 'maven3', mavenSettingsConfig: '', traceability: true) {
+                    sh 'mvn deploy -DskipTests=true'
+                }
+            }
+        }
+        stage('Docker Build') {
+            steps {
+                script {
+                    def dockerTag = "${env.BUILD_NUMBER}"
+                    sh "docker build -t ${dockerImage}:${dockerTag} ."
+                }
+            }
+        }
+        stage('amazon-ecr-push') {
+            steps {
+                script {
+                    def dockerTag = "${env.BUILD_NUMBER}"
+                    // Define Docker image name and tag
+                    sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REPO_URL}"
+                    // Tag the Docker image for ECR
+                    sh "docker tag ${dockerImage}:${dockerTag} ${ECR_REPO_URL}:${dockerTag}"
+                    sh "docker tag ${dockerImage}:${dockerTag} ${ECR_REPO_URL}:latest"
+                    // Push the Docker image to ECR
+                    sh "docker push ${ECR_REPO_URL}:${dockerTag}"
+                    sh "docker push ${ECR_REPO_URL}:latest"
+                }
+            }
+        }
+        stage('docker-imagescan') {
+            steps {
+                script {
+                def dockerTag = "${env.BUILD_NUMBER}"
+                sh "trivy image  --format table -o trivy-fs-report.html ${dockerImage}:${dockerTag}"
+                }
+            }
+        }
+        stage('Remove Local Docker Images') {
+            steps {
+                script {
+                    def dockerTag = "${env.BUILD_NUMBER}"
+                    sh "docker rmi ${dockerImage}:${dockerTag}"
+                    sh "docker rmi ${ECR_REPO_URL}:${dockerTag}"
+                    sh "docker rmi ${ECR_REPO_URL}:latest"
+                }
+            }
+        }
+        stage('update &deploy into k8'){
+            steps {
+                script {
+                        withKubeConfig(caCertificate: '', clusterName: 'my-eks2', contextName: '', credentialsId: 'k8s', namespace: 'webapps', restrictKubeConfigAccess: false, serverUrl: 'https://425F1BD2C12168ADB153D0CC47F9E1C0.gr7.us-east-1.eks.amazonaws.com') {
+                        def dockerTag = "${env.BUILD_NUMBER}"
+                        sh "sed -i 's|image:.*|image: ${ECR_REPO_URL}:latest|g' ds.yml"
+                        sh "kubectl apply -f ds.yml -n webapps"
+                        }
+                }
+            }    
+        }
+
+    }
+}
